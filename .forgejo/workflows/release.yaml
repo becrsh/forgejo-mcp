@@ -1,0 +1,81 @@
+# Releases our forgejo-mcp image to Zot on a version tag (bcc/README.md). Only gerry may create tags *.*.* on
+# github/forgejo-mcp (Forgejo tag protection, app-def.talos: manifests/forgejo/github-sync.yaml). The image is
+# zot.zot.svc/forgejo-mcp/forgejo-mcp:<tag>; Zot lets the user forgejo-mcp push only under forgejo-mcp/ and never
+# overwrite a tag. The digest goes in the release on Forgejo; gerry pins it in app-def.talos.
+name: release
+
+on:
+  push:
+    tags: ['*.*.*']
+
+env:
+  GO_VERSION: go1.27.4
+  # sha256 of go1.27.4.linux-amd64.tar.gz, from https://go.dev/dl/?mode=json
+  GO_SHA256: 7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+  CRANE_VERSION: v0.22.1
+  # sha256 of go-containerregistry_Linux_x86_64.tar.gz, from the release's checksums.txt
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  GOVULNCHECK_VERSION: v1.1.4
+  REGISTRY: zot.zot.svc
+
+jobs:
+  image:
+    runs-on: in-cluster
+    timeout-minutes: 30
+    steps:
+      - name: Check the version
+        # Our own numbers: upstream's version with -bcc.N, for example 3.5.0-bcc.1
+        run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+-bcc\.[0-9]+$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not a version like 3.5.0-bcc.1"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - name: Install Go and crane
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/go.tar.gz" "https://go.dev/dl/$GO_VERSION.linux-amd64.tar.gz"
+          echo "$GO_SHA256  $RUNNER_TEMP/go.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/go.tar.gz" -C "$RUNNER_TEMP"
+          curl -fsSL -o "$RUNNER_TEMP/crane.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "GOPATH=$RUNNER_TEMP/gopath" >> "$GITHUB_ENV"
+          echo "GOCACHE=$RUNNER_TEMP/gocache" >> "$GITHUB_ENV"
+          # Go's own toolchain, never a newer one a go.mod asks for
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+          # crane's login goes here, not into a home directory another job could see
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+      - name: Check the code
+        # Upstream's tests, and the known vulnerabilities the code reaches (the review found none with this Go)
+        run: |
+          go mod verify
+          go vet ./...
+          go test -short ./...
+          go run "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK_VERSION" ./...
+      - name: Build and push
+        env:
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+        run: |
+          image="$REGISTRY/forgejo-mcp/forgejo-mcp:$GITHUB_REF_NAME"
+          crane auth login "$REGISTRY" -u forgejo-mcp --password-stdin <<<"$ZOT_PASSWORD"
+          # The trust bundle in the runner (SSL_CERT_FILE) holds bcc-ca, which signed zot.zot.svc's certificate
+          VERSION="$GITHUB_REF_NAME" bcc/build-image.sh "$image"
+          digest=$(crane digest "$image")
+          echo "IMAGE=$image@$digest" >> "$GITHUB_ENV"
+          echo "Pushed $image@$digest"
+      - name: Report the digest on Forgejo
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # node, not jq: the runner's image (node:22-bookworm) has no jq
+          body=$(node -e 'const [tag, image, sha] = process.argv.slice(1); console.log(JSON.stringify({tag_name: tag, name: tag,
+            body: "Image:\n\n```\n" + image + "\n```\n\nBuilt from " + sha + ". To deploy it, pin this reference in app-def.talos, `manifests/forgejo-mcp/deployment.yaml`."}))' \
+            "$GITHUB_REF_NAME" "$IMAGE" "$GITHUB_SHA")
+          # Forgejo ignores continue-on-error: a failed report only warns, the image is pushed and in the log above
+          curl -fsS -X POST -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' -d "$body" \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" >/dev/null ||
+            echo "::warning::Could not create the release on Forgejo; the image is $IMAGE"
