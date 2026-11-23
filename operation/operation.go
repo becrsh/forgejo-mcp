@@ -287,7 +287,7 @@ func Run(transport, version string) error {
 	log.Info("Testing connection to Forgejo instance",
 		log.SanitizedURLField("url", flag.URL),
 	)
-	if err := testConnection(); err != nil {
+	if err := testConnection(transport); err != nil {
 		log.Error("Failed to connect to Forgejo instance",
 			log.SanitizedURLField("url", flag.URL),
 			log.ErrorField(err),
@@ -345,7 +345,13 @@ func Run(transport, version string) error {
 	return nil
 }
 
-func testConnection() error {
+// testConnection checks the Forgejo instance before serving. A network
+// transport without a server token (every request brings its own) can only
+// check that the instance answers: see forgejo.VerifyReachable.
+func testConnection(transport string) error {
+	if transport != "stdio" && flag.Token == "" {
+		return forgejo.VerifyReachable(context.Background())
+	}
 	return forgejo.VerifyConnection()
 }
 
